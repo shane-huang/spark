@@ -20,6 +20,9 @@ import com.ning.compress.lzf.{LZFInputStream, LZFOutputStream}
 import sun.nio.ch.DirectBuffer
 
 
+import spark.netty.ShuffleCopier
+import io.netty.buffer.ByteBuf
+
 private[spark] class BlockManagerId(var ip: String, var port: Int) extends Externalizable {
   def this() = this(null, 0)  // For deserialization only
 
@@ -368,6 +371,21 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
   }
 
   /**
+   * A request to fetch one or more blocks, complete with their sizes
+   */
+  class FetchRequest(val address: BlockManagerId, val blocks: Seq[(String, Long)]) {
+    val size = blocks.map(_._2).sum
+  }
+
+  /**
+   * A result of a fetch. Includes the block ID, size in bytes, and a function to deserialize
+   * the block (since we want all deserializaton to happen in the calling thread); can also
+   * represent a fetch failure if size == -1.
+   */
+  class FetchResult(val blockId: String, val size: Long, val deserialize: () => Iterator[Any]) {
+    def failed: Boolean = size == -1
+  }
+  /**
    * Get multiple blocks from local and remote block manager using their BlockManagerIds. Returns
    * an Iterator of (block ID, value) pairs so that clients may handle blocks in a pipelined
    * fashion as they're received. Expects a size in bytes to be provided for each block fetched,
@@ -381,24 +399,29 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
     }
     val totalBlocks = blocksByAddress.map(_._2.size).sum
     logDebug("Getting " + totalBlocks + " blocks")
-    var startTime = System.currentTimeMillis
     val localBlockIds = new ArrayBuffer[String]()
     val remoteBlockIds = new HashSet[String]()
 
-    // A result of a fetch. Includes the block ID, size in bytes, and a function to deserialize
-    // the block (since we want all deserializaton to happen in the calling thread); can also
-    // represent a fetch failure if size == -1.
-    class FetchResult(val blockId: String, val size: Long, val deserialize: () => Iterator[Any]) {
-      def failed: Boolean = size == -1
+    val useNetty = System.getProperty("spark.shuffle.use.netty", "false").toBoolean
+    if (useNetty) {
+      getMultipleNetty(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
+    } else {
+      getMutipleNIO(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
     }
+  }
 
+  /**
+   * Use Original NIO way to get blocks
+   */
+  private def getMultipleNIO(
+    blocksByAddress: Seq[(BlockManagerId, Seq[(String, Long)])],
+    totalBlocks: Long,
+    localBlockIds: ArrayBuffer[String],
+    remoteBlockIds: HashSet[String]): Iterator[(String, Option[Iterator[Any]])] = {
+
+    var startTime = System.currentTimeMillis
     // A queue to hold our results.
     val results = new LinkedBlockingQueue[FetchResult]
-
-    // A request to fetch one or more blocks, complete with their sizes
-    class FetchRequest(val address: BlockManagerId, val blocks: Seq[(String, Long)]) {
-      val size = blocks.map(_._2).sum
-    }
 
     // Queue of fetch requests to issue; we'll pull requests off this gradually to make sure that
     // the number of bytes in flight is limited to maxBytesInFlight
@@ -415,7 +438,7 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
         case (blockId, size) => BlockMessage.fromGetBlock(GetBlock(blockId))
       })
       bytesInFlight += req.size
-      val sizeMap = req.blocks.toMap  // so we can look up the size of each blockID
+      val sizeMap = req.blocks.toMap // so we can look up the size of each blockID
       val future = connectionManager.sendMessageReliably(cmId, blockMessageArray.toBufferMessage)
       future.onSuccess {
         case Some(message) => {
@@ -441,6 +464,148 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       }
     }
 
+    val remoteRequests = splitLocalRemoteRequests(blocksByAddress, localBlockIds, remoteBlockIds)
+    // Add the remote requests into our queue in a random order
+    fetchRequests ++= Utils.randomize(remoteRequests)
+
+    // Send out initial requests for blocks, up to our maxBytesInFlight
+    while (!fetchRequests.isEmpty &&
+      (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
+      sendRequest(fetchRequests.dequeue())
+    }
+
+    val numGets = remoteBlockIds.size - fetchRequests.size
+    logInfo("Started " + numGets + " remote gets in " + Utils.getUsedTimeMs(startTime))
+
+    getLocalBlocks(localBlockIds, results)
+
+    // Return an iterator that will read fetched blocks off the queue as they arrive.
+    return new Iterator[(String, Option[Iterator[Any]])] {
+      var resultsGotten = 0
+
+      def hasNext: Boolean = resultsGotten < totalBlocks
+
+      def next(): (String, Option[Iterator[Any]]) = {
+        resultsGotten += 1
+        val result = results.take()
+        bytesInFlight -= result.size
+        if (!fetchRequests.isEmpty &&
+          (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
+          sendRequest(fetchRequests.dequeue())
+        }
+        (result.blockId, if (result.failed) None else Some(result.deserialize()))
+      }
+    }
+  }
+
+  /**
+   * Use Netty to get blocks
+   */
+  private def getMultipleNetty(
+    blocksByAddress: Seq[(BlockManagerId, Seq[(String, Long)])],
+    totalBlocks: Long,
+    localBlockIds: ArrayBuffer[String],
+    remoteBlockIds: HashSet[String]): Iterator[(String, Option[Iterator[Any]])] = {
+
+    var startTime = System.currentTimeMillis
+    // A queue to hold our results.
+    val results = new LinkedBlockingQueue[FetchResult]
+
+    def putResult(blockId:String, blockSize:Long, blockData:ByteBuffer,
+                  results : LinkedBlockingQueue[FetchResult]){
+       results.put(new FetchResult(
+          blockId, blockSize, () => dataDeserialize(blockId, blockData) ))
+    }
+
+    // Queue of fetch requests to issue; we'll pull requests off this gradually to make sure that
+    // the number of bytes in flight is limited to maxBytesInFlight
+    val fetchRequests = new LinkedBlockingQueue[FetchRequest]
+
+    def startCopiers (numCopiers: Int): List [ _ <: Thread]= {
+      (for ( i <- Range(0,numCopiers) ) yield {
+          val copier = new Thread {
+             override def run(){
+               while(!isInterrupted && !fetchRequests.isEmpty) {
+                sendRequest(fetchRequests.take())
+               }
+             }
+          }
+          copier.start
+          copier
+      }).toList
+    }
+
+    //keep this to interrupt the threads when necessary
+    def stopCopiers(copiers : List[_ <: Thread]) {
+      for (copier <- copiers) {
+        copier.interrupt()
+      }
+    }
+
+    def sendRequest(req: FetchRequest) {
+      logDebug("Sending request for %d blocks (%s) from %s".format(
+        req.blocks.size, Utils.memoryBytesToString(req.size), req.address.ip))
+      val cmId = new ConnectionManagerId(req.address.ip, System.getProperty("spark.shuffle.sender.port", "6653").toInt)
+      //val cpier = new HttpShuffleCopier
+      val cpier = new ShuffleCopier
+      cpier.getBlocks(cmId,req.blocks,(blockId:String,blockSize:Long,blockData:ByteBuf) => putResult(blockId,blockSize,blockData.nioBuffer,results))
+      logDebug("Sent request for remote blocks " + req.blocks + " from " + req.address.ip )
+    }
+
+    val remoteRequests = splitLocalRemoteRequests(blocksByAddress, localBlockIds, remoteBlockIds)
+    // Add the remote requests into our queue in a random order
+    for (request <- Utils.randomize(remoteRequests)) {
+      fetchRequests.put(request)
+    }
+
+    val copiers = startCopiers(System.getProperty("spark.shuffle.copier.threads", "6").toInt)
+
+    logInfo("Started " + fetchRequests.size + " remote gets in " + Utils.getUsedTimeMs(startTime))
+
+    getLocalBlocks(localBlockIds, results)
+
+    // Return an iterator that will read fetched blocks off the queue as they arrive.
+    return new Iterator[(String, Option[Iterator[Any]])] {
+      var resultsGotten = 0
+
+      def hasNext: Boolean = resultsGotten < totalBlocks
+
+      def next(): (String, Option[Iterator[Any]]) = {
+        resultsGotten += 1
+        val result = results.take()
+        // if all the results has been retrieved
+        // shutdown the copiers
+        if (resultsGotten == totalBlocks) {
+          stopCopiers(copiers)
+        }
+        (result.blockId, if (result.failed) None else Some(result.deserialize()))
+      }
+    }
+  }
+
+  private def getLocalBlocks(localBlockIds: ArrayBuffer[String], results: LinkedBlockingQueue[FetchResult]) {
+    // Get the local blocks while remote blocks are being fetched. Note that it's okay to do
+    // these all at once because they will just memory-map some files, so they won't consume
+    // any memory that might exceed our maxBytesInFlight
+    var startTime = System.currentTimeMillis
+    for (id <- localBlockIds) {
+      getLocal(id) match {
+        case Some(iter) => {
+          results.put(new FetchResult(id, 0, () => iter)) // Pass 0 as size since it's not in flight
+          logDebug("Got local block " + id)
+        }
+        case None => {
+          throw new BlockException(id, "Could not get block " + id + " from local machine")
+        }
+      }
+    }
+    logDebug("Got local blocks in " + Utils.getUsedTimeMs(startTime) + " ms")
+  }
+
+  private def splitLocalRemoteRequests(
+    blocksByAddress: Seq[(BlockManagerId, Seq[(String, Long)])],
+    localBlockIds: ArrayBuffer[String],
+    remoteBlockIds: HashSet[String]): ArrayBuffer[FetchRequest] = {
     // Split local and remote blocks. Remote blocks are further split into FetchRequests of size
     // at most maxBytesInFlight in order to limit the amount of data in flight.
     val remoteRequests = new ArrayBuffer[FetchRequest]
@@ -474,52 +639,7 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
         }
       }
     }
-    // Add the remote requests into our queue in a random order
-    fetchRequests ++= Utils.randomize(remoteRequests)
-
-    // Send out initial requests for blocks, up to our maxBytesInFlight
-    while (!fetchRequests.isEmpty &&
-        (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
-      sendRequest(fetchRequests.dequeue())
-    }
-
-    val numGets = remoteBlockIds.size - fetchRequests.size
-    logInfo("Started " + numGets + " remote gets in " + Utils.getUsedTimeMs(startTime))
-
-    // Get the local blocks while remote blocks are being fetched. Note that it's okay to do
-    // these all at once because they will just memory-map some files, so they won't consume
-    // any memory that might exceed our maxBytesInFlight
-    startTime = System.currentTimeMillis
-    for (id <- localBlockIds) {
-      getLocal(id) match {
-        case Some(iter) => {
-          results.put(new FetchResult(id, 0, () => iter)) // Pass 0 as size since it's not in flight
-          logDebug("Got local block " + id)
-        }
-        case None => {
-          throw new BlockException(id, "Could not get block " + id + " from local machine")
-        }
-      }
-    }
-    logDebug("Got local blocks in " + Utils.getUsedTimeMs(startTime) + " ms")
-
-    // Return an iterator that will read fetched blocks off the queue as they arrive.
-    return new Iterator[(String, Option[Iterator[Any]])] {
-      var resultsGotten = 0
-
-      def hasNext: Boolean = resultsGotten < totalBlocks
-
-      def next(): (String, Option[Iterator[Any]]) = {
-        resultsGotten += 1
-        val result = results.take()
-        bytesInFlight -= result.size
-        if (!fetchRequests.isEmpty &&
-            (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
-          sendRequest(fetchRequests.dequeue())
-        }
-        (result.blockId, if (result.failed) None else Some(result.deserialize()))
-      }
-    }
+    remoteRequests
   }
 
   def put(blockId: String, values: Iterator[Any], level: StorageLevel, tellMaster: Boolean)

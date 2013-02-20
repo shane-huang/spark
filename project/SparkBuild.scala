@@ -131,7 +131,8 @@ object SparkBuild extends Build {
       "colt" % "colt" % "1.2.0",
       "cc.spray" % "spray-can" % "1.0-M2.1",
       "cc.spray" % "spray-server" % "1.0-M2.1",
-      "org.apache.mesos" % "mesos" % "0.9.0-incubating"
+      "org.apache.mesos" % "mesos" % "0.9.0-incubating",
+      "io.netty" % "netty-all" % "4.0.0.Beta2" from "http://mirrors.ibiblio.org/maven2/io/netty/netty-all/4.0.0.Beta2/netty-all-4.0.0.Beta2.jar"
     ) ++ (if (HADOOP_MAJOR_VERSION == "2") Some("org.apache.hadoop" % "hadoop-client" % HADOOP_VERSION) else None).toSeq,
     unmanagedSourceDirectories in Compile <+= baseDirectory{ _ / ("src/hadoop" + HADOOP_MAJOR_VERSION + "/scala") }
   ) ++ assemblySettings ++ extraAssemblySettings ++ Twirl.settings
