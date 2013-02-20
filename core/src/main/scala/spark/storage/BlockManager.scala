@@ -19,6 +19,7 @@ import spark.util.ByteBufferInputStream
 import com.ning.compress.lzf.{LZFInputStream, LZFOutputStream}
 import sun.nio.ch.DirectBuffer
 
+import spark.HttpShuffleCopier
 
 private[spark] class BlockManagerId(var ip: String, var port: Int) extends Externalizable {
   def this() = this(null, 0)  // For deserialization only
@@ -395,6 +396,12 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
     // A queue to hold our results.
     val results = new LinkedBlockingQueue[FetchResult]
 
+    def putResult(blockId:String, blockSize:Long, blockData:ByteBuffer,
+                  results : LinkedBlockingQueue[FetchResult]){
+       results.put(new FetchResult(
+          blockId, blockSize, () => dataDeserialize(blockId, blockData) ))
+    }
+
     // A request to fetch one or more blocks, complete with their sizes
     class FetchRequest(val address: BlockManagerId, val blocks: Seq[(String, Long)]) {
       val size = blocks.map(_._2).sum
@@ -402,43 +409,39 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
 
     // Queue of fetch requests to issue; we'll pull requests off this gradually to make sure that
     // the number of bytes in flight is limited to maxBytesInFlight
-    val fetchRequests = new Queue[FetchRequest]
+    val fetchRequests = new LinkedBlockingQueue[FetchRequest]
 
     // Current bytes in flight from our requests
     var bytesInFlight = 0L
 
+    def startCopiers (numCopiers: Int): List [ _ <: Thread]= {
+      (for ( i <- Range(0,numCopiers) ) yield {
+          val copier = new Thread {
+             override def run(){
+               while(!isInterrupted && !fetchRequests.isEmpty) {
+                sendRequest(fetchRequests.take())
+               }
+             }
+          }
+          copier.start
+          copier
+      }).toList
+    }
+
+    //keep this to interrupt the threads when necessary
+    def stopCopiers(copiers : List[_ <: Thread]) {
+      for (copier <- copiers) {
+        copier.interrupt()
+      }
+    }
+
     def sendRequest(req: FetchRequest) {
       logDebug("Sending request for %d blocks (%s) from %s".format(
         req.blocks.size, Utils.memoryBytesToString(req.size), req.address.ip))
-      val cmId = new ConnectionManagerId(req.address.ip, req.address.port)
-      val blockMessageArray = new BlockMessageArray(req.blocks.map {
-        case (blockId, size) => BlockMessage.fromGetBlock(GetBlock(blockId))
-      })
-      bytesInFlight += req.size
-      val sizeMap = req.blocks.toMap  // so we can look up the size of each blockID
-      val future = connectionManager.sendMessageReliably(cmId, blockMessageArray.toBufferMessage)
-      future.onSuccess {
-        case Some(message) => {
-          val bufferMessage = message.asInstanceOf[BufferMessage]
-          val blockMessageArray = BlockMessageArray.fromBufferMessage(bufferMessage)
-          for (blockMessage <- blockMessageArray) {
-            if (blockMessage.getType != BlockMessage.TYPE_GOT_BLOCK) {
-              throw new SparkException(
-                "Unexpected message " + blockMessage.getType + " received from " + cmId)
-            }
-            val blockId = blockMessage.getId
-            results.put(new FetchResult(
-              blockId, sizeMap(blockId), () => dataDeserialize(blockId, blockMessage.getData)))
-            logDebug("Got remote block " + blockId + " after " + Utils.getUsedTimeMs(startTime))
-          }
-        }
-        case None => {
-          logError("Could not get block(s) from " + cmId)
-          for ((blockId, size) <- req.blocks) {
-            results.put(new FetchResult(blockId, -1, null))
-          }
-        }
-      }
+      val cmId = new ConnectionManagerId(req.address.ip, System.getProperty("spark.shuffle.sender.port", "6653").toInt)
+      val cpier = new HttpShuffleCopier
+      cpier.getBlocks(cmId,req.blocks,(blockId:String,blockSize:Long,blockData:ByteBuffer) => putResult(blockId,blockSize,blockData,results))
+      logInfo("Got remote blocks " + req.blocks + " from " + req.address.ip )
     }
 
     // Split local and remote blocks. Remote blocks are further split into FetchRequests of size
@@ -475,13 +478,11 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       }
     }
     // Add the remote requests into our queue in a random order
-    fetchRequests ++= Utils.randomize(remoteRequests)
-
-    // Send out initial requests for blocks, up to our maxBytesInFlight
-    while (!fetchRequests.isEmpty &&
-        (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
-      sendRequest(fetchRequests.dequeue())
+    for (request <- Utils.randomize(remoteRequests)){
+      fetchRequests.put(request)
     }
+
+    val copiers = startCopiers(System.getProperty("spark.shuffle.copier.threads", "6").toInt)
 
     val numGets = remoteBlockIds.size - fetchRequests.size
     logInfo("Started " + numGets + " remote gets in " + Utils.getUsedTimeMs(startTime))
@@ -512,11 +513,11 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       def next(): (String, Option[Iterator[Any]]) = {
         resultsGotten += 1
         val result = results.take()
-        bytesInFlight -= result.size
-        if (!fetchRequests.isEmpty &&
-            (bytesInFlight == 0 || bytesInFlight + fetchRequests.front.size <= maxBytesInFlight)) {
-          sendRequest(fetchRequests.dequeue())
-        }
+        // if all the results has been retrieved
+        // shutdown the copiers
+        //if (resultsGotten == totalBlocks){
+        //  stopCopiers(copiers)
+        //}
         (result.blockId, if (result.failed) None else Some(result.deserialize()))
       }
     }

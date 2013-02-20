@@ -11,15 +11,18 @@ import it.unimi.dsi.fastutil.io.FastBufferedOutputStream
 import scala.collection.mutable.ArrayBuffer
 
 import spark.Utils
+import spark.Logging
 
 /**
  * Stores BlockManager blocks on disk.
  */
 private class DiskStore(blockManager: BlockManager, rootDirs: String)
-  extends BlockStore(blockManager) {
+  extends BlockStore(blockManager) with Logging {
 
   val MAX_DIR_CREATION_ATTEMPTS: Int = 10
   val subDirsPerLocalDir = System.getProperty("spark.diskStore.subDirectories", "64").toInt
+
+  var shuffleSender: Process = null
 
   // Create one local directory for each path mentioned in spark.local.dir; then, inside this
   // directory, create multiple subdirectories that we will hash files into, in order to avoid
@@ -28,6 +31,8 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
   val subDirs = Array.fill(localDirs.length)(new Array[File](subDirsPerLocalDir))
 
   addShutdownHook()
+
+  startShuffleBlockSender()
 
   override def getSize(blockId: String): Long = {
     getFile(blockId).length()
@@ -174,7 +179,41 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
       override def run() {
         logDebug("Shutdown hook called")
         localDirs.foreach(localDir => Utils.deleteRecursively(localDir))
+        if (shuffleSender != null)
+          shuffleSender.destroy()
       }
     })
+  }
+
+  private def startShuffleBlockSender (){
+    try {
+      val port = System.getProperty("spark.shuffle.sender.port", "6653")
+      val envVar = System.getenv("SPARK_HOME")
+      val sparkHome = new File(if (envVar == null) "." else envVar)
+      val directories = localDirs.map(_.getAbsolutePath())
+      val script = if (System.getProperty("os.name").startsWith("Windows")) "run.cmd" else "run"
+      val runScript = new File(sparkHome, script).getCanonicalPath
+      //block
+      //val className = "spark.BlockStoreShuffleSender"
+      //http
+      val className = "spark.HttpShuffleSender"
+
+      val commands = Seq(runScript, className, port, subDirsPerLocalDir.toString) ++ directories
+   
+      val builder = new ProcessBuilder(commands: _*).directory(new File("/tmp"))
+      shuffleSender = builder.start()
+      logInfo("Started Process using command : " + commands)
+    } catch {
+      case interrupted: InterruptedException =>
+        logInfo("Runner thread for ShuffleBlockSender interrupted")
+
+      case e: Exception => {
+        logError("Error running ShuffleBlockSender ", e)
+        if (shuffleSender != null) {
+          shuffleSender.destroy()
+          shuffleSender = null
+        }
+      }
+    }
   }
 }

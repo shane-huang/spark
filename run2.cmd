@@ -24,6 +24,9 @@ if "x%SPARK_DAEMON_MEMORY%" == "x" set SPARK_DAEMON_MEMORY=512m
 if "%RUNNING_DAEMON%"=="1" set SPARK_MEM=%SPARK_DAEMON_MEMORY%
 if "%RUNNING_DAEMON%"=="1" set SPARK_JAVA_OPTS=%SPARK_DAEMON_JAVA_OPTS%
 
+if "x%SPARK_SHUFFLESENDER_MEM%" == "x" set SPARK_SHUFFLESENDER_MEM=1g
+if "%1"=="spark.HttpShuffleSender" set SPARK_MEM=%SPARK_SHUFFLESENDER_MEM%
+
 rem Check that SCALA_HOME has been specified
 if not "x%SCALA_HOME%"=="x" goto scala_exists
   echo SCALA_HOME is not set
