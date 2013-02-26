@@ -32,9 +32,12 @@ private[spark] class HttpShuffleCopier extends Logging {
 
   def getBlock(cmId: ConnectionManagerId, blockId: String, blockSize:Long): ByteBuffer = {
 
+    def parseInt(s: String) = try { Some(s.toInt) } catch { case _ => None }
+
     val connection = openConnection(cmId,blockId)
 
-    val contentLen = connection.getHeaderField(HttpHeaders.CONTENT_LENGTH).toInt
+    val contentLen = parseInt(connection.getHeaderField(HttpHeaders.CONTENT_LENGTH)).getOrElse(0)
+    
     logDebug("http response reported block " + blockId + " is of size " + contentLen + " bytes")
 
     //we read from the HTTP response header for the size of block
