@@ -19,7 +19,9 @@ import spark.util.ByteBufferInputStream
 import com.ning.compress.lzf.{LZFInputStream, LZFOutputStream}
 import sun.nio.ch.DirectBuffer
 
-import spark.HttpShuffleCopier
+
+import spark.netty.ShuffleCopier
+import io.netty.buffer.ByteBuf
 
 private[spark] class BlockManagerId(var ip: String, var port: Int) extends Externalizable {
   def this() = this(null, 0)  // For deserialization only
@@ -439,9 +441,10 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       logDebug("Sending request for %d blocks (%s) from %s".format(
         req.blocks.size, Utils.memoryBytesToString(req.size), req.address.ip))
       val cmId = new ConnectionManagerId(req.address.ip, System.getProperty("spark.shuffle.sender.port", "6653").toInt)
-      val cpier = new HttpShuffleCopier
-      cpier.getBlocks(cmId,req.blocks,(blockId:String,blockSize:Long,blockData:ByteBuffer) => putResult(blockId,blockSize,blockData,results))
-      logInfo("Got remote blocks " + req.blocks + " from " + req.address.ip )
+      //val cpier = new HttpShuffleCopier
+      val cpier = new ShuffleCopier
+      cpier.getBlocks(cmId,req.blocks,(blockId:String,blockSize:Long,blockData:ByteBuf) => putResult(blockId,blockSize,blockData.nioBuffer,results))
+      logDebug("Sent request for remote blocks " + req.blocks + " from " + req.address.ip )
     }
 
     // Split local and remote blocks. Remote blocks are further split into FetchRequests of size
@@ -515,9 +518,9 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
         val result = results.take()
         // if all the results has been retrieved
         // shutdown the copiers
-        //if (resultsGotten == totalBlocks){
-        //  stopCopiers(copiers)
-        //}
+        if (resultsGotten == totalBlocks){
+          stopCopiers(copiers)
+        }
         (result.blockId, if (result.failed) None else Some(result.deserialize()))
       }
     }

@@ -12,6 +12,8 @@ import scala.collection.mutable.ArrayBuffer
 
 import spark.Utils
 import spark.Logging
+import spark.netty.ShuffleSender
+import spark.netty.PathResolver
 
 /**
  * Stores BlockManager blocks on disk.
@@ -22,8 +24,9 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
   val MAX_DIR_CREATION_ATTEMPTS: Int = 10
   val subDirsPerLocalDir = System.getProperty("spark.diskStore.subDirectories", "64").toInt
 
-  var shuffleSender: Process = null
-
+  //var shuffleSender: Process = null
+  var shuffleSender : Thread = null
+  val thisInstance = this
   // Create one local directory for each path mentioned in spark.local.dir; then, inside this
   // directory, create multiple subdirectories that we will hash files into, in order to avoid
   // having really large inodes at the top level.
@@ -179,8 +182,9 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
       override def run() {
         logDebug("Shutdown hook called")
         localDirs.foreach(localDir => Utils.deleteRecursively(localDir))
-        if (shuffleSender != null)
-          shuffleSender.destroy()
+        //if (shuffleSender != null)
+        //  shuffleSender.destroy()
+        shuffleSender.stop
       }
     })
   }
@@ -188,31 +192,38 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
   private def startShuffleBlockSender (){
     try {
       val port = System.getProperty("spark.shuffle.sender.port", "6653")
-      val envVar = System.getenv("SPARK_HOME")
-      val sparkHome = new File(if (envVar == null) "." else envVar)
       val directories = localDirs.map(_.getAbsolutePath())
-      val script = if (System.getProperty("os.name").startsWith("Windows")) "run.cmd" else "run"
-      val runScript = new File(sparkHome, script).getCanonicalPath
-      //block
-      //val className = "spark.BlockStoreShuffleSender"
-      //http
-      val className = "spark.HttpShuffleSender"
 
-      val commands = Seq(runScript, className, port, subDirsPerLocalDir.toString) ++ directories
-   
-      val builder = new ProcessBuilder(commands: _*).directory(new File("/tmp"))
-      shuffleSender = builder.start()
-      logInfo("Started Process using command : " + commands)
+      val pResolver = new PathResolver {
+        def getAbsolutePath(blockId:String):String = {
+          if (!blockId.startsWith("shuffle_")) {
+            return null
+          }
+          thisInstance.getFile(blockId).getAbsolutePath()
+        }
+      } 
+      shuffleSender = new Thread {
+        override def run() = {
+          val sender = new ShuffleSender(port.toInt,pResolver)
+          logInfo("created ShuffleSender with block directories : "+ directories.mkString(","))
+          sender.start
+          logInfo("ShuffleSender stopped")
+        }
+      }
+      shuffleSender.setDaemon(true)
+      shuffleSender.start
+  
     } catch {
       case interrupted: InterruptedException =>
         logInfo("Runner thread for ShuffleBlockSender interrupted")
 
       case e: Exception => {
         logError("Error running ShuffleBlockSender ", e)
-        if (shuffleSender != null) {
-          shuffleSender.destroy()
-          shuffleSender = null
-        }
+        //if (shuffleSender != null) {
+        //  shuffleSender.destroy()
+        //  shuffleSender = null
+        //}
+        shuffleSender.stop
       }
     }
   }

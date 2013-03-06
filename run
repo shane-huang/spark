@@ -25,11 +25,6 @@ if [ "$1" = "spark.deploy.master.Master" -o "$1" = "spark.deploy.worker.Worker" 
   SPARK_JAVA_OPTS=$SPARK_DAEMON_JAVA_OPTS   # Empty by default
 fi
 
-#set memory option for http shuffle sender
-if [ "$1" = "spark.HttpShuffleSender" ] ; then
-  SPARK_MEM=${SPARK_SHUFFLESENDER_MEM:-1g}
-fi
-
 if [ "$SPARK_LAUNCH_WITH_SCALA" == "1" ]; then
   if [ `command -v scala` ]; then
     RUNNER="scala"
@@ -96,6 +91,7 @@ if [ -e "$FWDIR/lib_managed" ]; then
   CLASSPATH+=":$FWDIR/lib_managed/bundles/*"
 fi
 CLASSPATH+=":$REPL_DIR/lib/*"
+CLASSPATH+=":$CORE_DIR/lib/*"
 CLASSPATH+=":$BAGEL_DIR/target/scala-$SCALA_VERSION/classes"
 export CLASSPATH # Needed for spark-shell
 
