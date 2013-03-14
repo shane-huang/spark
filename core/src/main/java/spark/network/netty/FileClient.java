@@ -1,4 +1,4 @@
-package spark.netty;
+package spark.network.netty;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.AbstractChannel;

@@ -1,4 +1,4 @@
-package spark.netty;
+package spark.network.netty;
 
 public interface PathResolver {
   /**

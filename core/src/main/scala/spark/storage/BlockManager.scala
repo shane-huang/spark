@@ -20,7 +20,7 @@ import com.ning.compress.lzf.{LZFInputStream, LZFOutputStream}
 import sun.nio.ch.DirectBuffer
 
 
-import spark.netty.ShuffleCopier
+import spark.network.netty.ShuffleCopier
 import io.netty.buffer.ByteBuf
 
 private[spark] class BlockManagerId(var ip: String, var port: Int) extends Externalizable {
@@ -406,7 +406,7 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
     if (useNetty) {
       getMultipleNetty(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
     } else {
-      getMutipleNIO(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
+      getMultipleNIO(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
     }
   }
 
@@ -546,7 +546,6 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       logDebug("Sending request for %d blocks (%s) from %s".format(
         req.blocks.size, Utils.memoryBytesToString(req.size), req.address.ip))
       val cmId = new ConnectionManagerId(req.address.ip, System.getProperty("spark.shuffle.sender.port", "6653").toInt)
-      //val cpier = new HttpShuffleCopier
       val cpier = new ShuffleCopier
       cpier.getBlocks(cmId,req.blocks,(blockId:String,blockSize:Long,blockData:ByteBuf) => putResult(blockId,blockSize,blockData.nioBuffer,results))
       logDebug("Sent request for remote blocks " + req.blocks + " from " + req.address.ip )

@@ -12,8 +12,8 @@ import scala.collection.mutable.ArrayBuffer
 
 import spark.Utils
 import spark.Logging
-import spark.netty.ShuffleSender
-import spark.netty.PathResolver
+import spark.network.netty.ShuffleSender
+import spark.network.netty.PathResolver
 
 /**
  * Stores BlockManager blocks on disk.
@@ -24,7 +24,6 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
   val MAX_DIR_CREATION_ATTEMPTS: Int = 10
   val subDirsPerLocalDir = System.getProperty("spark.diskStore.subDirectories", "64").toInt
 
-  //var shuffleSender: Process = null
   var shuffleSender : Thread = null
   val thisInstance = this
   // Create one local directory for each path mentioned in spark.local.dir; then, inside this
@@ -194,8 +193,7 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
 
   private def startShuffleBlockSender (){
     try {
-      val port = System.getProperty("spark.shuffle.sender.port", "6653")
-      val directories = localDirs.map(_.getAbsolutePath())
+      val port = System.getProperty("spark.shuffle.sender.port", "6653").toInt
 
       val pResolver = new PathResolver {
         def getAbsolutePath(blockId:String):String = {
@@ -207,8 +205,8 @@ private class DiskStore(blockManager: BlockManager, rootDirs: String)
       } 
       shuffleSender = new Thread {
         override def run() = {
-          val sender = new ShuffleSender(port.toInt,pResolver)
-          logInfo("created ShuffleSender with block directories : "+ directories.mkString(","))
+          val sender = new ShuffleSender(port,pResolver)
+          logInfo("created ShuffleSender binding to port : "+ port)
           sender.start
         }
       }

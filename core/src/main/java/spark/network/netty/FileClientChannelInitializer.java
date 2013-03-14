@@ -1,4 +1,4 @@
-package spark.netty;
+package spark.network.netty;
 
 import io.netty.buffer.BufType;
 import io.netty.channel.ChannelInitializer;

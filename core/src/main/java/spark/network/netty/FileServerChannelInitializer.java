@@ -1,4 +1,4 @@
-package spark.netty;
+package spark.network.netty;
 
 import java.io.File;
 import io.netty.buffer.BufType;

@@ -1,4 +1,4 @@
-package spark.netty
+package spark.network.netty
 
 import io.netty.buffer.ByteBuf
 import io.netty.channel.ChannelHandlerContext
@@ -81,7 +81,7 @@ private[spark] object ShuffleCopier extends Logging {
     val threads = if (args.length>3) args(3).toInt else 10
 
     val copiers = Executors.newFixedThreadPool(80)
-    for (i <- Range(1,threads)){
+    for (i <- Range(0,threads)){
       val runnable = new Runnable() {
         def run() {
           runGetBlock(host,port,file)

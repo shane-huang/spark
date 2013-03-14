@@ -1,4 +1,4 @@
-package spark.netty;
+package spark.network.netty;
 
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundMessageHandlerAdapter;
