@@ -67,8 +67,8 @@ public class FileClient {
   } 
 
   public void sendRequest(String file){
-    //assert(file == null)
-    //assert(channel == null)
+    //assert(file == null);
+    //assert(channel == null);
     channel.write(file+"\r\n");
   }
 

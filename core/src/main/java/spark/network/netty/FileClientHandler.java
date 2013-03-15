@@ -30,11 +30,9 @@ public abstract class FileClientHandler extends ChannelInboundByteHandlerAdapter
     if(in.readableBytes() >= currentHeader.fileLen()){
       handle(ctx,in,currentHeader);
       currentHeader = null;
+      ctx.close();
     }
   }
 
-  public void closeContext(ChannelHandlerContext ctx){
-    ctx.close();
-  }
 }
 

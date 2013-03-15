@@ -33,7 +33,7 @@ public class FileServerHandler extends
         return;
       }
       long length = file.length();
-      if (length > Integer.MAX_VALUE) {
+      if (length > Integer.MAX_VALUE || length <= 0 ) {
         //logger.info("too large file : " + file.getAbsolutePath() + " of size "+ length);
         ctx.write(new FileHeader(0, blockId).buffer());
         ctx.flush();

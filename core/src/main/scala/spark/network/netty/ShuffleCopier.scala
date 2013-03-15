@@ -15,41 +15,35 @@ private[spark] class ShuffleCopier extends Logging {
 
   def getBlock(cmId: ConnectionManagerId,
     blockId: String,
-    size: Long,
     resultCollectCallback: (String, Long, ByteBuf) => Unit) = {
 
     val handler = new ShuffleClientHandler(resultCollectCallback)
     val fc = new FileClient(handler)
-    fc.init();
+    fc.init()
     fc.connect(cmId.host, cmId.port)
     fc.sendRequest(blockId)
-    fc.waitForClose();
-    fc.close();
+    fc.waitForClose()
+    fc.close()
   }
-  
+
   def getBlocks(cmId: ConnectionManagerId,
     blocks: Seq[(String, Long)],
     resultCollectCallback: (String, Long, ByteBuf) => Unit) = {
 
-    blocks.map { 
-      case (blockId, size) => {
-        getBlock(cmId,blockId,size,resultCollectCallback)
+    blocks.map {
+      case(blockId,size) => {
+        getBlock(cmId,blockId,resultCollectCallback)
       }
     }
   }
-
 }
 
 private[spark] class ShuffleClientHandler(val resultCollectCallBack: (String, Long, ByteBuf) => Unit ) extends FileClientHandler with Logging {
 
   def handle(ctx: ChannelHandlerContext, in: ByteBuf, header: FileHeader) {
-
-    logInfo("Received Block: " + header.blockId);
-    //in.readBytes(header.fileLen)
+    logDebug("Received Block: " + header.blockId + " (" + header.fileLen + "B)");
     resultCollectCallBack(header.blockId, header.fileLen.toLong, in.readBytes(header.fileLen))
-    closeContext(ctx);
   }
-
 }
 
 private[spark] object ShuffleCopier extends Logging {
@@ -65,7 +59,6 @@ private[spark] object ShuffleCopier extends Logging {
     fc.init();
     fc.connect(host, port)
     fc.sendRequest(file)
-    //Thread.sleep(2000)
     fc.waitForClose();
     fc.close()
   }

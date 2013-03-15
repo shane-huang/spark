@@ -19,7 +19,6 @@ import spark.util.ByteBufferInputStream
 import com.ning.compress.lzf.{LZFInputStream, LZFOutputStream}
 import sun.nio.ch.DirectBuffer
 
-
 import spark.network.netty.ShuffleCopier
 import io.netty.buffer.ByteBuf
 
@@ -397,16 +396,14 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
     if (blocksByAddress == null) {
       throw new IllegalArgumentException("BlocksByAddress is null")
     }
-    val totalBlocks = blocksByAddress.map(_._2.size).sum
-    logDebug("Getting " + totalBlocks + " blocks")
     val localBlockIds = new ArrayBuffer[String]()
     val remoteBlockIds = new HashSet[String]()
 
     val useNetty = System.getProperty("spark.shuffle.use.netty", "false").toBoolean
     if (useNetty) {
-      getMultipleNetty(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
+      getMultipleNetty(blocksByAddress, localBlockIds, remoteBlockIds)
     } else {
-      getMultipleNIO(blocksByAddress, totalBlocks, localBlockIds, remoteBlockIds)
+      getMultipleNIO(blocksByAddress, localBlockIds, remoteBlockIds)
     }
   }
 
@@ -415,9 +412,11 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
    */
   private def getMultipleNIO(
     blocksByAddress: Seq[(BlockManagerId, Seq[(String, Long)])],
-    totalBlocks: Long,
     localBlockIds: ArrayBuffer[String],
     remoteBlockIds: HashSet[String]): Iterator[(String, Option[Iterator[Any]])] = {
+
+    val totalBlocks = blocksByAddress.map(_._2.size).sum
+    logDebug("Getting " + totalBlocks + " blocks")
 
     var startTime = System.currentTimeMillis
     // A queue to hold our results.
@@ -503,7 +502,6 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
    */
   private def getMultipleNetty(
     blocksByAddress: Seq[(BlockManagerId, Seq[(String, Long)])],
-    totalBlocks: Long,
     localBlockIds: ArrayBuffer[String],
     remoteBlockIds: HashSet[String]): Iterator[(String, Option[Iterator[Any]])] = {
 
@@ -525,9 +523,14 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       (for ( i <- Range(0,numCopiers) ) yield {
           val copier = new Thread {
              override def run(){
+              try {
                while(!isInterrupted && !fetchRequests.isEmpty) {
                 sendRequest(fetchRequests.take())
                }
+              } catch {
+                case x: InterruptedException => logInfo("Copier Interrupted")
+                case _ => throw new SparkException("Exception Throw in Shuffle Copier")
+              }
              }
           }
           copier.start
@@ -551,7 +554,7 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       logDebug("Sent request for remote blocks " + req.blocks + " from " + req.address.ip )
     }
 
-    val remoteRequests = splitLocalRemoteRequests(blocksByAddress, localBlockIds, remoteBlockIds)
+    val (totalBlocks, remoteRequests) = splitLocalRemoteRequestsOptimized(blocksByAddress, localBlockIds, remoteBlockIds)
     // Add the remote requests into our queue in a random order
     for (request <- Utils.randomize(remoteRequests)) {
       fetchRequests.put(request)
@@ -639,6 +642,58 @@ class BlockManager(val master: BlockManagerMaster, val serializer: Serializer, m
       }
     }
     remoteRequests
+  }
+
+  private def splitLocalRemoteRequestsOptimized(
+    blocksByAddress: Seq[(BlockManagerId, Seq[(String, Long)])],
+    localBlockIds: ArrayBuffer[String],
+    remoteBlockIds: HashSet[String]): (Int,ArrayBuffer[FetchRequest]) = {
+
+    // Split local and remote blocks. Remote blocks are further split into FetchRequests of size
+    // at most maxBytesInFlight in order to limit the amount of data in flight.
+
+    var totalBlocks = blocksByAddress.map(_._2.size).sum
+    logInfo("Getting " + totalBlocks + " blocks")
+
+    val remoteRequests = new ArrayBuffer[FetchRequest]
+    for ((address, blockInfos) <- blocksByAddress) {
+      if (address == blockManagerId) {
+        localBlockIds ++= blockInfos.map(_._1)
+      } else {
+        remoteBlockIds ++= blockInfos.map(_._1)
+        // Make our requests at least maxBytesInFlight / 5 in length; the reason to keep them
+        // smaller than maxBytesInFlight is to allow multiple, parallel fetches from up to 5
+        // nodes, rather than blocking on reading output from one node.
+        val minRequestSize = math.max(maxBytesInFlight / 5, 1L)
+        logInfo("maxBytesInFlight: " + maxBytesInFlight + ", minRequest: " + minRequestSize)
+        val iterator = blockInfos.iterator
+        var curRequestSize = 0L
+        var curBlocks = new ArrayBuffer[(String, Long)]
+        while (iterator.hasNext) {
+          val (blockId, size) = iterator.next()
+          if (size > 0) {
+            curBlocks += ((blockId, size))
+            curRequestSize += size
+          } else if (size == 0){
+            totalBlocks -= 1
+          } else {
+            throw new SparkException("Negative block size "+blockId)
+          }
+          if (curRequestSize >= minRequestSize) {
+            // Add this FetchRequest
+            remoteRequests += new FetchRequest(address, curBlocks)
+            curRequestSize = 0
+            curBlocks = new ArrayBuffer[(String, Long)]
+          }
+        }
+        // Add in the final request
+        if (!curBlocks.isEmpty) {
+          remoteRequests += new FetchRequest(address, curBlocks)
+        }
+      }
+    }
+    logInfo("Getting " + totalBlocks + " blocks (after eliminated zero byte blocks) ")
+    (totalBlocks, remoteRequests)
   }
 
   def put(blockId: String, values: Iterator[Any], level: StorageLevel, tellMaster: Boolean)
